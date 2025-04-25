@@ -1,0 +1,1 @@
+# AESTRA_OCA vise à reproduire les résultats obtenu dans le papier : et améliorer leur compréhension en documentant le processus, éventuellement proposé des améliorations / vérifier les limitations du modèle du papier
