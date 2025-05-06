@@ -11,8 +11,6 @@ import torch.nn as nn
 from torch.utils.data import random_split, Dataset
 import time
 import pandas as pd
-torch.cuda.empty_cache()
-torch.cuda.ipc_collect()
 
 class SpectrumDataset(Dataset):
 
@@ -100,11 +98,11 @@ class SpectrumDataset(Dataset):
         ):
 
         # On charge le fichier Analyse_material, celui-ci contient le spectre template et la grille de longueur d'ondes
-        with open('STAR1134_HPN_Analyse_material.p', 'rb') as f:
+        with open('/workspace/tllopis/STAR1134_HPN_Analyse_material.p', 'rb') as f:
             analyse_material_data = pickle.load(f)
 
         wave_numpy = analyse_material_data['wave'].to_numpy(dtype='float64') # -> dtype=float64
-        specs_numpy = np.load('STAR1134_HPN_flux_YVA.npy').astype('float64') # -> De taille (n_spec, n_pixel) / dtype=float64
+        specs_numpy = np.load('/workspace/tllopis/STAR1134_HPN_flux_YVA.npy').astype('float64') # -> De taille (n_spec, n_pixel) / dtype=float64
 
         # On peut choisir de crop ou non le spectre sur certaines zones de longueur d'ondes
         if lambda_min is None:
@@ -175,7 +173,7 @@ class SpectrumDataset(Dataset):
 
         self.Kp = Kp
         self.P = P
-        self.jdb = pd.read_csv('STAR1134_HPN_Analyse_summary.csv')['jdb'].to_numpy()
+        self.jdb = pd.read_csv('/workspace/tllopis/STAR1134_HPN_Analyse_summary.csv')['jdb'].to_numpy()
 
         if self.Kp is not None and self.P is not None:
             self.inject_planetary_signal_in_data()
@@ -578,48 +576,18 @@ class SPENDER(nn.Module):
     def forward(self, x):
         x = x.unsqueeze(1)
         
-        print('-- Entrée dans SPENDER --')
-        print(x.shape)
-        
         # Encoding
         x = self.convblock1(x)
-
-        print('-- Après ConvBlock1 --')
-        print(x.shape)
-
-
         x = self.convblock2(x)
-
-        print('-- Après ConvBlock2 --')
-        print(x.shape)
-
         x = self.convblock3(x)
-
-        print('-- Après ConvBlock3 --')
-        print(x.shape)
 
         C = x.shape[1] // 2 # Nombre de canaux
         h, k = torch.split(x, [C, C], dim=1) # On divise en deux
 
-        print('-- Taille h --')
-        print(h.shape)
-        print('-- Taille k --')
-        print(k.shape)
-
         a = self.softmax(k)
-
-        print('-- Taille a --')
-        print(a.shape)
-
         e = torch.sum(h * a, dim=-1) # On somme selon les longueurs d'ondes -> sortie [B, C]
 
-        print('-- Taille e --')
-        print(e.shape)
-
         s = self.latentMLP(e) # Vecteur latent
-
-        print('-- Taille s --')
-        print(s.shape)
 
         self.current_latent = s
         
@@ -709,6 +677,8 @@ class RVEstimator(nn.Module):
 if __name__ == '__main__':
     torch.backends.cudnn.benchmark = True
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    print(device)
 
     # ----------- Hyperparamètres ----------- 
 
@@ -806,7 +776,14 @@ if __name__ == '__main__':
 
             L_fid = torch.nn.functional.mse_loss(batch_yobsprime, batch_yobs)
 
-            L_tot = L_fid + L_RV
+            if k_reg < 1000:
+                k_reg += 0.001
+            else:
+                k_reg = 0
+
+            L_reg = k_reg * torch.sum((batch_yact**2) / sigmay**2) / (batch_yact.shape[0] * batch_yact.shape[1])
+
+            L_tot = L_fid + L_RV + L_reg
 
             train_loss += L_tot.item() * current_B
 
@@ -850,7 +827,9 @@ if __name__ == '__main__':
 
                 L_fid = torch.nn.functional.mse_loss(batch_yobsprime, batch_yobs)
 
-                L_tot = L_fid + L_RV
+                L_reg = k_reg * torch.sum((batch_yact**2) / sigmay**2) / (batch_yact.shape[0] * batch_yact.shape[1])
+
+                L_tot = L_fid + L_RV + L_reg
 
                 test_loss += L_tot.item() * current_B
 
