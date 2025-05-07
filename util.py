@@ -363,42 +363,88 @@ def torch_interp(x: torch.Tensor, xp: torch.Tensor, fp: torch.Tensor, dim: int=-
 class SpectrumDataset(Dataset):
 
     """
-        Charge les spectres du dataset du rv-datachallenge Plato.
+    Classe de chargement et prétraitement des spectres du RV-DataChallenge Plato.
 
-        ----- Paramètres d'initialisation -----
+    Paramètres d'initialisation
+    ----------------------------
+    n_pixel : int
+        Nombre d’échantillons sur la grille de longueurs d’onde (L).  
+        Par défaut 2000.
 
-        * n_pixel = correspond à L dans AESTRA -> Nb d'échantillons
-                                                  Dans AESTRA : 2000
+    lambda_min, lambda_max : float ou None
+        Bornes minimale et maximale du domaine spectral (en Å).  
+        Si None, on utilise les valeurs extraites du spectre d’origine.  
+        Par défaut 5000.0 – 5050.0 Å.
 
-        * lambda_min, lambda_max               -> Bornes inf et sup du domaine du spectre, si None on prend ceux du spectre d'origine
-                                                  Dans AESTRA : 5000 - 5050 Å
+    precision : {'torch.float32', 'torch.float64'}
+        Précision des tenseurs retournés par __getitem__ (utilisés lors de l'entraînement).
 
-        
-        ----- Variables internes accessibles ----- 
+    Attributs internes accessibles
+    ------------------------------
+    n_spec, n_pixel : int
+        Nombre de spectres et nombre de pixels par spectre.
 
-        * self.n_spec, self.n_pixel
+    all_specs_numpy : ndarray, shape (n_spec, n_pixel), dtype float64
+        Spectres bruts rééchantillonnés (ou non) sur la grille régulière.
 
-        * self.all_specs_numpy         -> ndarray de taille (n_spec, n_pixel)        dtype=float32
+    wave_numpy : ndarray, shape (n_pixel,), dtype float64
+        Grille de longueurs d’onde.
 
-        * self.wave_numpy              -> ndarray de taille (n_pixel, )              dtype=float32
+    template_spec_numpy : ndarray, shape (n_pixel,), dtype float64
+        Spectre « template » rééchantillonné.
 
-        * self.template_spec_numpy     -> ndarray de taille (n_pixel, )              dtype=float32
-        
-        * self.all_specs_torch         -> tensor de taille [n_spec, n_pixel]         dtype=float32
+    all_specs_torch32/64 : Tensor, shape [n_spec, n_pixel]
+        Même données que all_specs_numpy, mais converties en float32 et float64.
 
-        * self.wave_torch              -> tensor de taille [n_pixel]                 dtype=float32
+    wave_torch32/64 : Tensor, shape [n_pixel]
+        Même données que wave_numpy, converties en float32 et float64.
 
-        * self.template_spec_torch     -> tensor de taille [n_pixel]                 dtype=float32
+    template_spec_torch32/64 : Tensor, shape [n_pixel]
+        Même données que template_spec_numpy, converties en float32 et float64.
 
-        * self.c
+    c : float
+        Vitesse de la lumière (299 792 458 m/s).
 
-        * self.wavelength_step         -> Pas de la grille de longueur d'onde        dtype=float
+    c_tensor : Tensor, shape [1], dtype float64
+        Même valeur que c, en tenseur.
 
+    wavelength_step : float
+        Pas entre deux pixels consécutifs de la grille.
 
-               
+    all_augmented_specs_* : tensors / ndarray
+        Versions « doppler-shiftées » agrégées (après appel à augment_data).
+
+    Méthodes clés
+    -------------
+    __len__()
+        Renvoie le nombre de spectres (n_spec).
+
+    __getitem__(index)
+        Retourne ((y_obs, y_aug, v_offset), index) selon self.precision.
+
+    doppler_shift_batch(...)
+        Applique un décalage doppler à un batch de spectres.
+
+    plot_spec(...)
+        Affiche un spectre (et optionnellement le template).
+
+    plot_doppler(...)
+        Affiche un spectre avant/après décalage doppler.
+
+    augment_data(...)
+        Génère automatiquement les spectres shiftés pour tout le dataset.
     """
-    def __init__(self, n_pixel = 2000, lambda_min=5000., lambda_max=5050.):
-        
+
+    def __init__(
+            self, n_pixel = 2000, 
+            lambda_min=5000., 
+            lambda_max=5050., 
+            precision='torch.float32', 
+            device='cpu',
+            Kp = 10,
+            P = 100
+        ):
+
         # On charge le fichier Analyse_material, celui-ci contient le spectre template et la grille de longueur d'ondes
         with open('STAR1134_HPN_Analyse_material.p', 'rb') as f:
             analyse_material_data = pickle.load(f)
@@ -444,19 +490,45 @@ class SpectrumDataset(Dataset):
             self.all_specs_numpy = specs_numpy
             self.wave_numpy = wave_numpy
             self.template_spec_numpy = template_spec_numpy
+
+        self.device = device # Pour mettre ce qui est nécessaire sur GPU
         
         # Conversion en torch (dtype = float64)
-        self.all_specs_torch = torch.from_numpy(self.all_specs_numpy)
-        self.wave_torch = torch.from_numpy(self.wave_numpy)
-        self.template_spec_torch = torch.from_numpy(self.template_spec_numpy)
+        self.all_specs_torch64 = torch.from_numpy(self.all_specs_numpy).to(self.device, non_blocking=True)
+        self.wave_torch64 = torch.from_numpy(self.wave_numpy).to(self.device, non_blocking=True)
+        self.template_spec_torch64 = torch.from_numpy(self.template_spec_numpy).to(self.device, non_blocking=True)
+
+        self.all_specs_torch32   = self.all_specs_torch64.to(torch.float32)
+        self.wave_torch32        = self.wave_torch64.to(torch.float32)
+        self.template_spec_torch32 = self.template_spec_torch64.to(torch.float32)
 
         # Données supplémentaires utiles sur le dataset:
         self.n_spec, self.n_pixel = self.all_specs_numpy.shape
 
         self.c = 299_792_458.0
-        self.c_tensor = torch.tensor([299_792_458.0], dtype=torch.float64)
+        self.c_tensor = torch.tensor([299_792_458.0], dtype=torch.float64).to(self.device, non_blocking=True)
 
-        self.wavelength_step = (lambda_max - lambda_min) / (self.n_pixel)
+        self.precision = precision
+
+        self.wavelength_step = (lambda_max - lambda_min) / (self.n_pixel - 1)
+
+        self.all_augmented_specs_torch64 = None
+        self.all_augmented_specs_torch32 = None
+        self.all_augmented_specs_numpy = None
+
+        self.all_voffsets64 = None
+        self.all_voffsets32 = None
+
+        self.Kp = Kp
+        self.P = P
+        self.jdb = pd.read_csv('STAR1134_HPN_Analyse_summary.csv')['jdb'].to_numpy()
+
+        if self.Kp is not None and self.P is not None:
+            self.inject_planetary_signal_in_data()
+            
+        self.augment_data(interp_method='torch_interp', batch_voffset=None)
+
+
 
     # Renvoie la longueur du dataset (n_spec)
     def __len__(self):
@@ -467,90 +539,60 @@ class SpectrumDataset(Dataset):
         return (f"-- Dataset de {self.n_spec} spectres de {self.n_pixel} pixels --\n-- λmin = {self.wave_numpy.min()}, λmax = {self.wave_numpy.max()} --\n-- Pas : {self.wavelength_step} λ --")
     
     def __getitem__(self, index):
-        batch_yobs = self.all_specs_torch[index, :] # Renvoie un batch [B, n_pixel] dtype = torch.float64
+        if self.precision == 'torch.float64':
+            batch_yobs = self.all_specs_torch64[index, :] # Renvoie un batch [B, n_pixel] dtype = torch.float32
+            batch_yaug = self.all_augmented_specs_torch64[index, :] # Renvoie un batch [B, n_pixel] dtype = torch.float32
+            batch_voffset = self.all_voffsets64[index]
 
-        return batch_yobs, index
+        else:
+            batch_yobs = self.all_specs_torch32[index, :] # Renvoie un batch [B, n_pixel] dtype = torch.float32
+            batch_yaug = self.all_augmented_specs_torch32[index, :] # Renvoie un batch [B, n_pixel] dtype = torch.float32
+            batch_voffset = self.all_voffsets32[index]
+            
+        return (batch_yobs, batch_yaug, batch_voffset), index
 
     # Shift un batch de spectre avec un batch de vitesses d'offset données
-    def doppler_shift_batch(self, batch_yobs, batch_voffset, interp_method='np.interp'):
+    def doppler_shift_batch(self, batch_yobs, batch_voffset, interp_method='torch_interp', out_dtype='torch.float32'):
         """
-            Simule un shift doppler pour un batch de spectre de dim [B, n_pixel] et un batch de vitesse d'offset de taille [B]
+            Simule un shift doppler pour un batch de spectre de dim [B, n_pixel] et un batch de vitesse d'offset de taille [B, 1]
             Retourne un batch de spectres augmentés de taille [B, n_pixel]
 
             On dispose de différentes d'interpolation : 
 
-             * np.interp -> Méthode linéaire classique mais plus lente que torch_interp qui fait pareil
-             * scipy.interpolate.interp1d -> Interpolation cubique
              * torch_interp -> Méthode linéaire parrallélisée -> gain de perf
              * cubic_transform -> Le plus lent, Méthode utilisée par AESTRA
 
         """
 
-        # Méthode numpy classique -> interpolation linéaire et valeurs de frontières fixées constantes -> Meilleure option en terme de perf pour de petits batch
-        if interp_method == 'np.interp':
-            # On va stocker les spectres shiftés dans batch_yaug de taille [B, n_pixel]
-            batch_yaug = np.zeros(shape=batch_yobs.shape, dtype='float32')
-
-            for i, yobs_i in enumerate(batch_yobs):                 # yobs_i est un tenseur de taille [n_pixel] de dtype=float32
-                
-                yobs_i_numpy = yobs_i.numpy()                       # ndarray de taille (n_pixel, ) 
-                voffset_i = batch_voffset[i].numpy()                # float32
-
-                doppler_factor = np.sqrt((1 - voffset_i/self.c) / (1 + voffset_i/self.c), dtype='float32') # float32
-
-                wave_shifted_numpy = self.wave_numpy * doppler_factor
-
-
-                yaug_i_numpy = np.interp(self.wave_numpy, wave_shifted_numpy, yobs_i_numpy)
-
-                
-                batch_yaug[i, :] = yaug_i_numpy
-            
-            batch_yaug = torch.from_numpy(batch_yaug) # De taille [B, n_pixel] de type float32 -> Ok
-    
-            return batch_yaug
-
-        # Méthode scipy -> interpolation cubique et valeurs de frontières extrapolées
-        elif interp_method == 'scipy.interpolate.interp1d':
-            # On va stocker les spectres shiftés dans batch_yaug de taille [B, n_pixel]
-            batch_yaug = np.zeros(shape=batch_yobs.shape, dtype='float32')
-
-            for i, yobs_i in enumerate(batch_yobs):                 # yobs_i est un tenseur de taille [n_pixel] de dtype=float32
-                
-                yobs_i_numpy = yobs_i.numpy()                       # ndarray de taille (n_pixel, ) 
-                voffset_i = batch_voffset[i].numpy()                # float32
-
-                doppler_factor = np.sqrt((1 - voffset_i/self.c) / (1 + voffset_i/self.c), dtype='float32') # float32
-
-                wave_shifted_numpy = self.wave_numpy * doppler_factor
-
-                interpolator = interp1d(wave_shifted_numpy, yobs_i, kind='cubic', bounds_error=False, fill_value="extrapolate" ,assume_sorted=True)
-
-                yaug_i_numpy = interpolator(self.wave_numpy)
-
-                batch_yaug[i, :] = yaug_i_numpy
-            
-            batch_yaug = torch.from_numpy(batch_yaug) # De taille [B, n_pixel] de type float32 -> Ok
-    
-            return batch_yaug
-
         # Méthode parallélisée -> interpolation linéaire et valeurs de frontières fixées constantes
-        elif interp_method == 'torch_interp':
+        if interp_method == 'torch_interp':
 
             # On travaille par batch
             B = batch_yobs.shape[0]
             
-            batch_wave = self.wave_torch.unsqueeze(0) # [n_pixel] -> [1, n_pixel]
+            batch_wave = self.wave_torch64.unsqueeze(0) # [n_pixel] -> [1, n_pixel]
             batch_wave = batch_wave.expand(B, -1) # [B, n_pixel]
+            batch_wave = batch_wave
 
-            batch_doppler_factor = torch.sqrt( (1 - batch_voffset/self.c_tensor) /  (1 + batch_voffset/self.c_tensor)) # [B]
-            batch_doppler_factor = batch_doppler_factor.unsqueeze(-1) # [B, 1] pour pouvoir faire du [B, n_pixel] * [B, 1] par la suite 
+            if batch_voffset.dtype != 'torch.float64':
+                batch_voffset = batch_voffset.double()
+
+            if batch_yobs.dtype != 'torch.float64':
+                batch_yobs = batch_yobs.double()
+
+            batch_doppler_factor = torch.sqrt( (1 + batch_voffset/self.c_tensor) /  (1 - batch_voffset/self.c_tensor)) # [B, 1]
             
-            batch_wave_shifted = batch_wave * batch_doppler_factor # Ressort en double
+            # Pour vérifier si le facteur gamma ne vaut pas bêtement 1 pour cause de précision
+            # print('Valeur du facteur gamma : ', batch_doppler_factor[0].item()) 
 
-            batch_yaug = torch_interp(batch_wave, batch_wave_shifted, batch_yobs)
+            batch_wave_shifted = batch_wave * batch_doppler_factor # [B, n_pixel] * [B, 1] (Ressort en float64)
 
-            return batch_yaug
+            batch_yaug = torch_interp(batch_wave, batch_wave_shifted, batch_yobs) # [B, n_pixel] en float64
+
+            if out_dtype == 'torch.float64':
+                return batch_yaug.double() 
+            else:
+                return batch_yaug.float() 
         
         # Méthode utilisée dans AESTRA -> un peu plus rapide que scipy.interpolate.interp1d() sur de gros batch > 1000 mais sinon très lent
         elif interp_method == 'cubic_transform':
@@ -564,27 +606,30 @@ class SpectrumDataset(Dataset):
             # On travaille par batch
             B = batch_yobs.shape[0]
 
-            batch_wave = self.wave_torch.unsqueeze(0) # [n_pixel] -> [1, n_pixel]
+            batch_wave = self.wave_torch64.unsqueeze(0) # [n_pixel] -> [1, n_pixel]
             batch_wave = batch_wave.expand(B, -1) # [B, n_pixel]
+            batch_wave = batch_wave
 
-            # Conversion en double car besoin d'une grande précision
-            batch_voffset_double = batch_voffset.double() 
+            if batch_voffset.dtype != 'torch.float64':
+                batch_voffset = batch_voffset.double()
 
-            batch_doppler_factor = torch.sqrt( (1 - batch_voffset_double/self.c_tensor) /  (1 + batch_voffset_double/self.c_tensor)) # [B]
-            batch_doppler_factor = batch_doppler_factor.unsqueeze(-1) # [B, 1] pour pouvoir faire du [B, n_pixel] * [B, 1] par la suite 
+            if batch_yobs.dtype != 'torch.float64':
+                batch_yobs = batch_yobs.double()
+
+            batch_doppler_factor = torch.sqrt( (1 - batch_voffset/self.c_tensor) /  (1 + batch_voffset/self.c_tensor)) # [B, 1]
             
-            batch_wave_shifted = batch_wave * batch_doppler_factor
-
-            batch_wave_shifted = batch_wave_shifted.float() 
-
+            batch_wave_shifted = batch_wave * batch_doppler_factor # [B, n_pixel]
 
             batch_yaug = cubic_transform(
-                xrest=self.wave_torch,
+                xrest=self.wave_torch64,
                 yrest=batch_yobs,
                 wave_shifted=batch_wave_shifted
             )
 
-            return batch_yaug
+            if out_dtype == 'torch.float64':
+                return batch_yaug.double() 
+            else:
+                return batch_yaug.float() 
             
     # Plot un spec du dataset
     def plot_spec(self, index = None, with_template=False):
@@ -622,8 +667,8 @@ class SpectrumDataset(Dataset):
         spec_to_plot = self.all_specs_numpy[index, :]
         
         # Il faut le mettre sous forme de batch pour le rentrer dans la fonction doppler_shift_batch
-        batched_spec_to_plot = self.all_specs_torch[index, :].unsqueeze(0) # Le unsqueeze rajoute la dimension du batch au début 
-        batched_voffset = torch.tensor([v_offset])
+        batched_spec_to_plot = self.all_specs_torch64[index, :].unsqueeze(0) # Le unsqueeze rajoute la dimension du batch au début 
+        batched_voffset = torch.tensor([v_offset]).unsqueeze(0) # Le unsqueeze rajoute la dimension du batch au début 
 
         batch_yaug = self.doppler_shift_batch(batched_spec_to_plot, batched_voffset, interp_method)
 
@@ -657,3 +702,48 @@ class SpectrumDataset(Dataset):
             plt.grid(alpha=0.5)
             plt.show()
     
+    def augment_data(self, interp_method='torch_interp', batch_voffset=None):
+        if batch_voffset is None:
+            batch_voffset = torch.rand(size=(self.n_spec, 1), dtype=torch.float64, device=self.device)* 6 - 3 # Distrib uniforme entre -3 et 3
+
+        self.all_augmented_specs_torch32 = self.doppler_shift_batch(
+            batch_yobs    = self.all_specs_torch64,  # On interpole sur tout les spectres
+            batch_voffset = batch_voffset,
+            interp_method = interp_method,
+            out_dtype     = 'torch.float32'
+            )
+        
+        self.all_augmented_specs_torch64 = self.doppler_shift_batch(
+            batch_yobs    = self.all_specs_torch64,  # On interpole sur tout les spectres
+            batch_voffset = batch_voffset,
+            interp_method = interp_method,
+            out_dtype     = 'torch.float64'
+            )
+        
+        self.all_augmented_specs_numpy = self.all_augmented_specs_torch64.cpu().numpy()
+
+        self.all_voffsets64 = batch_voffset
+        self.all_voffsets32 = batch_voffset.float()
+
+        print('Dataset augmenté !')
+
+    def inject_planetary_signal_in_data(self, interp_method='torch_interp'):
+        t = torch.tensor(self.jdb).unsqueeze(-1).to(self.device) # On récupère le vecteur temps [n_spec, 1]
+        
+        batch_voffset = self.Kp * torch.sin(t * 2*torch.pi / self.P) + 3 * torch.sin(t * 2*torch.pi / 65)
+        
+        self.all_specs_torch32 = self.doppler_shift_batch(
+            batch_yobs    = self.all_specs_torch64,  # On interpole sur tout les spectres
+            batch_voffset = batch_voffset,
+            interp_method = interp_method,
+            out_dtype     = 'torch.float32'
+            )
+        
+        self.all_specs_torch64 = self.doppler_shift_batch(
+            batch_yobs    = self.all_specs_torch64,  # On interpole sur tout les spectres
+            batch_voffset = batch_voffset,
+            interp_method = interp_method,
+            out_dtype     = 'torch.float64'
+            )
+        
+        print('Signal planétaire injecté !')
